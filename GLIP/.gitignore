@@ -1,0 +1,7 @@
+
+build/
+bin/
+
+# Ignore compilation files
+*.hex
+*.elf
