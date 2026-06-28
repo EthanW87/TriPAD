@@ -6,6 +6,8 @@
 #include <Firebase_ESP_Client.h>
 #include "addons/TokenHelper.h"
 #include "addons/RTDBHelper.h"
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
 
 MPU6050 mpu;
 HardwareSerial pmsSerial(2);
@@ -38,9 +40,14 @@ PMS::DATA data;
 #define DATABASE_URL "https://glip-data-storage-default-rtdb.firebaseio.com/"
 #define DATABASE_SECRET "3AeNxjTWc84tYS0gKJgNR5ATq1asQxIRBAmMdMu5"
 
+#define BOT_TOKEN "8886495077:AAHy_oqOITHPqDkuSWKE9S1nMoQ2MZfAzh0"
+#define CHAT_ID "8015900696"
+
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
 
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASSWORD;
@@ -55,8 +62,22 @@ float sumSquares = 0;
 long sampleCount = 0;
 float currentDBA = 0.0; 
 
+// Global variables to hold the most recent VALID dust readings
+uint16_t stablePM1_0 = 0;
+uint16_t stablePM2_5 = 0;
+uint16_t stablePM10_0 = 0;
+
 // Global variable to pace the Serial Monitor printing
 unsigned long lastPrintTime = 0;
+
+bool vibrationAlertSent = false;
+bool noiseAlertSent = false;
+bool pm25AlertSent = false;
+bool pm10AlertSent = false;
+bool vibrationWarningSent = false;
+bool noiseWarningSent = false;
+bool pm25WarningSent = false;
+bool pm10WarningSent = false;
 
 void updateNoiseNonBlocking() {
   int raw = analogRead(MIC_PIN);
@@ -113,6 +134,10 @@ void setup() {
 
   Serial.println("Firebase connected");
 
+  client.setInsecure();
+  bot.sendMessage(CHAT_ID, "TriPAD Online - Monitoring Active", "");
+  Serial.println("Telegram message sent");
+
   pinMode(buttonPin, INPUT_PULLUP);
   
   
@@ -127,16 +152,29 @@ void setup() {
 }
 
 void loop() {
+
+  // Continuously sample the microphone and compute RMS voltage
+  updateNoiseNonBlocking();
+
+  // Continuously read the PMS dust sensor stream into the data buffer
+  bool newPMDataAvailable = pms.read(data);
+
+  if (newPMDataAvailable) {
+      stablePM1_0 = data.PM_SP_UG_1_0;
+      stablePM2_5 = data.PM_SP_UG_2_5;
+      stablePM10_0 = data.PM_SP_UG_10_0;
+    }
+  
   buttonState = digitalRead(buttonPin);
-  if (buttonState == LOW){
+  
+  // Only execute printing and uploading if the button is being pressed
+  if (buttonState == LOW) {
 
-    updateNoiseNonBlocking();
-
-    bool newPMDataAvailable = pms.read(data);
-
+    // Pace the execution block to run exactly once per second
     if (millis() - lastPrintTime >= 1000) {
       lastPrintTime = millis(); 
 
+      // Gather accelerometer data
       int16_t ax, ay, az;
       mpu.getAcceleration(&ax, &ay, &az);
 
@@ -145,72 +183,124 @@ void loop() {
       float azf = (az / 16384.0 * 9.8) + offsetZ;
       float magnitude = sqrt(axf * axf + ayf * ayf + azf * azf);
 
+      // --- Print Vibration Metrics ---
       Serial.print("VIBRATION | ");
       Serial.print(magnitude, 2);
       Serial.print(" m/s²");
-
       if (magnitude >= VIBRATION_DANGER) {
-        Serial.println(" ALERT: VIBRATION EXCEEDS 5.0 m/s²");
+        Serial.println(" ALERT: VIBRATION EXCEEDS 5.0 m/s²"); 
+        vibrationWarningSent = false; 
+        if (!vibrationAlertSent){
+          bot.sendMessage(CHAT_ID, "ALERT: VIBRATION EXCEEDS 5.0 m/s²", "");
+          vibrationAlertSent = true;
+        }
       } 
       else if (magnitude >= VIBRATION_WARNING) {
-        Serial.println(" | >>> WARNING: EXCEEDS 2.5 m/s² <<<");
+        Serial.println("WARNING: EXCEEDS 2.5 m/s²");
+        vibrationAlertSent = false;
+        if (!vibrationWarningSent){
+          bot.sendMessage(CHAT_ID, "WARNING: EXCEEDS 2.5 m/s²", "");
+          vibrationWarningSent = true;
+        }
       } 
       else {
         Serial.println(" | STATUS: NORMAL");
+        vibrationAlertSent = false;
+        vibrationWarningSent = false;
       }
 
+      // --- Print Noise Metrics (Now accurate!) ---
       Serial.print("NOISE     | ");
       Serial.print(currentDBA, 1);
       Serial.print(" dBA");
-
       if (currentDBA >= NOISE_LIMIT) {
-        Serial.println(" | >>> ALERT: EXCEEDS 85 dBA <<<");
-      } else if (currentDBA >= NOISE_WARNING) {
-        Serial.println(" | >>> WARNING: APPROACHING 85 dBA <<<");
-      } else {
-        Serial.println(" | STATUS: NORMAL");
+        Serial.println("ALERT: EXCEEDS 85 dBA");
+        noiseWarningSent = false;
+        if (!noiseAlertSent){
+          bot.sendMessage(CHAT_ID, "ALERT: EXCEEDS 85 dBA", "");
+          noiseAlertSent = true;
+        }        
+      } 
+      else if (currentDBA >= NOISE_WARNING) {
+        
+        Serial.println("WARNING: APPROACHING 85 dBA");
+        noiseAlertSent = false;
+        if (!noiseWarningSent){
+          bot.sendMessage(CHAT_ID, "WARNING: APPROACHING 85 dBA", "");
+          noiseWarningSent = true;
+        }
+      } 
+      else {
+        Serial.println("STATUS: NORMAL");
+        noiseAlertSent = false;
+        noiseWarningSent = false;
       }
 
-      Serial.print("DUST METRICS | ");
-      Serial.printf("PM1.0: %u ug/m³ | PM2.5: %u ug/m³ | PM10: %u ug/m³\n", 
-                    data.PM_SP_UG_1_0, data.PM_SP_UG_2_5, data.PM_SP_UG_10_0);
-      Serial.print("PM 2.5 STATUS:");
-      if (data.PM_SP_UG_2_5 >= PM25_DANGER){
-        Serial.println("ALERT: EXCEEDS EXPOSURE LIMIT (25 ug/m³)\n");
-      }
-      else if (data.PM_SP_UG_2_5 >= PM25_WARNING){
-        Serial.println("WARNING: ELEVATED LEVELS (15 ug/m³)\n");
-      }
-      else{
-        Serial.println("DUST LEVELS: NORMAL");
-      }
-
-      Serial.print("PM 10.-0 STATUS:");
-      if (data.PM_SP_UG_10_0 >= PM10_DANGER){
-        Serial.println("ALERT: EXCEEDS EXPOSURE LIMIT (50 ug/m³)\n");
-      }
-      else if (data.PM_SP_UG_10_0 >= PM10_WARNING){
-        Serial.println("WARNING: ELEVATED LEVELS (45 ug/m³)\n");
-      }
-      else{
-        Serial.println("DUST LEVELS: NORMAL");
-      }
-
-                    
-      Serial.println("------------------------------------------");
-
-      if (Firebase.ready()) {
-      // We pass the actual live variables here instead of the test constants
-      Firebase.RTDB.setFloat(&fbdo, "/tripAD/noise", currentDBA);
-      Firebase.RTDB.setFloat(&fbdo, "/tripAD/vibration", magnitude);
-      Firebase.RTDB.setInt(&fbdo, "/tripAD/pm25", data.PM_SP_UG_2_5);
-      Firebase.RTDB.setInt(&fbdo, "/tripAD/pm10", data.PM_SP_UG_10_0);
-      Firebase.RTDB.setInt(&fbdo, "/tripAD/pm1", data.PM_SP_UG_1_0);
-
-      Serial.println(">>> Live data synced to Firebase! <<<");
-    } else {
-      Serial.println(">>> Firebase Error: Not Ready <<<");
+      // --- Print Dust Metrics ---
+  Serial.print("DUST METRICS | ");
+  Serial.printf("PM1.0: %u ug/m³ | PM2.5: %u ug/m³ | PM10: %u ug/m³\n", 
+                stablePM1_0, stablePM2_5, stablePM10_0);
+                
+  Serial.print("PM 2.5 STATUS:");
+  if (stablePM2_5 >= PM25_DANGER){
+    
+    Serial.println("ALERT: EXCEEDS EXPOSURE LIMIT (25 ug/m³)");
+    pm25WarningSent = false;
+    if (!pm25AlertSent){
+      bot.sendMessage(CHAT_ID, "ALERT: EXCEEDS EXPOSURE LIMIT (25 ug/m³)\n", "");
+      pm25AlertSent = true;
     }
+  }
+  else if (stablePM2_5 >= PM25_WARNING){
+    
+    Serial.println("WARNING: ELEVATED LEVELS (15 ug/m³)");
+    pm25AlertSent = false;
+    if (!pm25WarningSent){
+      bot.sendMessage(CHAT_ID, "WARNING: ELEVATED LEVELS (15 ug/m³)\n", "");
+      pm25WarningSent = true;
+    }
+  }
+  else{
+    Serial.println("DUST LEVELS: NORMAL");
+    pm25AlertSent = false;
+    pm25WarningSent = false;
+  }
+
+  Serial.print("PM 10.0 STATUS:");
+  if (stablePM10_0 >= PM10_DANGER){
+    Serial.println("ALERT: EXCEEDS EXPOSURE LIMIT (50 ug/m³)\n");
+    pm10WarningSent = false;
+    if (!pm10AlertSent){
+      bot.sendMessage(CHAT_ID, "ALERT: EXCEEDS EXPOSURE LIMIT (50 ug/m³)", "");
+      pm10AlertSent = true;
+    }
+  }
+  else if (stablePM10_0 >= PM10_WARNING){
+    Serial.println("WARNING: ELEVATED LEVELS (45 ug/m³)\n");
+    pm10AlertSent = false;
+    if (!pm10WarningSent){
+      bot.sendMessage(CHAT_ID, "WARNING: ELEVATED LEVELS (45 ug/m³)", "");
+      pm10WarningSent = true;
+    }
+  }
+  else{
+    Serial.println("DUST LEVELS: NORMAL");
+    pm10AlertSent = false;
+    pm10WarningSent = false;
+  }       
+      // --- Firebase Sync ---
+      if (Firebase.ready()) {
+        Firebase.RTDB.setFloat(&fbdo, "/tripAD/noise", currentDBA);
+        Firebase.RTDB.setFloat(&fbdo, "/tripAD/vibration", magnitude);
+        Firebase.RTDB.setInt(&fbdo, "/tripAD/pm25", stablePM2_5);
+        Firebase.RTDB.setInt(&fbdo, "/tripAD/pm10", stablePM10_0);
+        Firebase.RTDB.setInt(&fbdo, "/tripAD/pm1", stablePM1_0);
+        Serial.println(">>> Live data synced to Firebase! <<<");
+      } else {
+        Serial.println(">>> Firebase Error: Not Ready <<<");
+      }
+      
+      Serial.println("------------------------------------------");
     }
   }
 }
