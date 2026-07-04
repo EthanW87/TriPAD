@@ -9,6 +9,16 @@
 #include <WiFiClientSecure.h>
 #include <UniversalTelegramBot.h>
 
+// --- New OLED Libraries ---
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1 // Reset pin # (or -1 if sharing Arduino reset pin)
+#define SCREEN_ADDRESS 0x3C // Common I2C address for 128x64 OLEDs
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
 MPU6050 mpu;
 HardwareSerial pmsSerial(2);
 PMS pms(pmsSerial);
@@ -79,6 +89,9 @@ bool noiseWarningSent = false;
 bool pm25WarningSent = false;
 bool pm10WarningSent = false;
 
+// Global variables for display tracking
+float globalMagnitude = 0.0;
+
 void updateNoiseNonBlocking() {
   int raw = analogRead(MIC_PIN);
   float voltage = raw * (3.3 / 4095.0);
@@ -103,9 +116,61 @@ void updateNoiseNonBlocking() {
   }
 }
 
+// --- New function to handle screen drawing ---
+void updateOLED() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  // Title
+  display.setCursor(0, 0);
+  display.println("--- TriPAD METRICS ---");
+  
+  // Vibration Row
+  display.setCursor(0, 16);
+  display.printf("Vib: %.2f m/s2", globalMagnitude);
+  if (globalMagnitude >= VIBRATION_DANGER) display.print(" !");
+  
+  // Noise Row
+  display.setCursor(0, 28);
+  display.printf("Noise: %.1f dBA", currentDBA);
+  if (currentDBA >= NOISE_LIMIT) display.print(" !");
+  
+  // Dust Row
+  display.setCursor(0, 40);
+  display.printf("PM2.5: %u | PM10: %u", stablePM2_5, stablePM10_0);
+  
+  // System Status
+  display.setCursor(0, 54);
+  if (WiFi.status() == WL_CONNECTED) {
+    display.print("WiFi: Connected");
+  } else {
+    display.print("WiFi: Disconnected");
+  }
+  
+  display.display();
+}
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Initialize I2C bus early so screen can show boot status
+  Wire.begin(21, 22);
+  delay(500);
+
+  // --- Initialize OLED ---
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    // Don't freeze execution, but log it
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0,20);
+    display.println("Booting TriPAD...");
+    display.display();
+  }
 
   Serial.println();
   Serial.print("Connecting to ");
@@ -124,7 +189,7 @@ void setup() {
   Serial.println("");
   Serial.println("Wi-Fi connected!");
   Serial.print("IP address: ");
-  Serial.println(WiFi.localIP()); // Prints the local IP assigned to your ESP32
+  Serial.println(WiFi.localIP());
 
   config.database_url = DATABASE_URL;
   config.signer.tokens.legacy_token = DATABASE_SECRET;  
@@ -140,11 +205,8 @@ void setup() {
 
   pinMode(buttonPin, INPUT_PULLUP);
   
-  
   pmsSerial.begin(9600, SERIAL_8N1, 16, 17); 
   
-  Wire.begin(21, 22);
-  delay(500);
   mpu.initialize();
 
   lastNoiseUpdate = millis();
@@ -167,7 +229,7 @@ void loop() {
   
   buttonState = digitalRead(buttonPin);
   
-  // Only execute printing and uploading if the button is being pressed
+  // Only execute printing, uploading, and screen refreshes if the button is pressed
   if (buttonState == LOW) {
 
     // Pace the execution block to run exactly once per second
@@ -181,13 +243,13 @@ void loop() {
       float axf = (ax / 16384.0 * 9.8) + offsetX;
       float ayf = (ay / 16384.0 * 9.8) + offsetY;
       float azf = (az / 16384.0 * 9.8) + offsetZ;
-      float magnitude = sqrt(axf * axf + ayf * ayf + azf * azf);
+      globalMagnitude = sqrt(axf * axf + ayf * ayf + azf * azf); // assigned to global for OLED usage
 
       // --- Print Vibration Metrics ---
       Serial.print("VIBRATION | ");
-      Serial.print(magnitude, 2);
+      Serial.print(globalMagnitude, 2);
       Serial.print(" m/s²");
-      if (magnitude >= VIBRATION_DANGER) {
+      if (globalMagnitude >= VIBRATION_DANGER) {
         Serial.println(" ALERT: VIBRATION EXCEEDS 5.0 m/s²"); 
         vibrationWarningSent = false; 
         if (!vibrationAlertSent){
@@ -195,7 +257,7 @@ void loop() {
           vibrationAlertSent = true;
         }
       } 
-      else if (magnitude >= VIBRATION_WARNING) {
+      else if (globalMagnitude >= VIBRATION_WARNING) {
         Serial.println("WARNING: EXCEEDS 2.5 m/s²");
         vibrationAlertSent = false;
         if (!vibrationWarningSent){
@@ -209,7 +271,7 @@ void loop() {
         vibrationWarningSent = false;
       }
 
-      // --- Print Noise Metrics (Now accurate!) ---
+      // --- Print Noise Metrics ---
       Serial.print("NOISE     | ");
       Serial.print(currentDBA, 1);
       Serial.print(" dBA");
@@ -237,61 +299,60 @@ void loop() {
       }
 
       // --- Print Dust Metrics ---
-  Serial.print("DUST METRICS | ");
-  Serial.printf("PM1.0: %u ug/m³ | PM2.5: %u ug/m³ | PM10: %u ug/m³\n", 
-                stablePM1_0, stablePM2_5, stablePM10_0);
-                
-  Serial.print("PM 2.5 STATUS:");
-  if (stablePM2_5 >= PM25_DANGER){
-    
-    Serial.println("ALERT: EXCEEDS EXPOSURE LIMIT (25 ug/m³)");
-    pm25WarningSent = false;
-    if (!pm25AlertSent){
-      bot.sendMessage(CHAT_ID, "ALERT: EXCEEDS EXPOSURE LIMIT (25 ug/m³)\n", "");
-      pm25AlertSent = true;
-    }
-  }
-  else if (stablePM2_5 >= PM25_WARNING){
-    
-    Serial.println("WARNING: ELEVATED LEVELS (15 ug/m³)");
-    pm25AlertSent = false;
-    if (!pm25WarningSent){
-      bot.sendMessage(CHAT_ID, "WARNING: ELEVATED LEVELS (15 ug/m³)\n", "");
-      pm25WarningSent = true;
-    }
-  }
-  else{
-    Serial.println("DUST LEVELS: NORMAL");
-    pm25AlertSent = false;
-    pm25WarningSent = false;
-  }
+      Serial.print("DUST METRICS | ");
+      Serial.printf("PM1.0: %u ug/m³ | PM2.5: %u ug/m³ | PM10: %u ug/m³\n", 
+                    stablePM1_0, stablePM2_5, stablePM10_0);
+                    
+      Serial.print("PM 2.5 STATUS:");
+      if (stablePM2_5 >= PM25_DANGER){
+        Serial.println("ALERT: EXCEEDS EXPOSURE LIMIT (25 ug/m³)");
+        pm25WarningSent = false;
+        if (!pm25AlertSent){
+          bot.sendMessage(CHAT_ID, "ALERT: EXCEEDS EXPOSURE LIMIT (25 ug/m³)\n", "");
+          pm25AlertSent = true;
+        }
+      }
+      else if (stablePM2_5 >= PM25_WARNING){
+        Serial.println("WARNING: ELEVATED LEVELS (15 ug/m³)");
+        pm25AlertSent = false;
+        if (!pm25WarningSent){
+          bot.sendMessage(CHAT_ID, "WARNING: ELEVATED LEVELS (15 ug/m³)\n", "");
+          pm25WarningSent = true;
+        }
+      }
+      else{
+        Serial.println("DUST LEVELS: NORMAL");
+        pm25AlertSent = false;
+        pm25WarningSent = false;
+      }
 
-  Serial.print("PM 10.0 STATUS:");
-  if (stablePM10_0 >= PM10_DANGER){
-    Serial.println("ALERT: EXCEEDS EXPOSURE LIMIT (50 ug/m³)\n");
-    pm10WarningSent = false;
-    if (!pm10AlertSent){
-      bot.sendMessage(CHAT_ID, "ALERT: EXCEEDS EXPOSURE LIMIT (50 ug/m³)", "");
-      pm10AlertSent = true;
-    }
-  }
-  else if (stablePM10_0 >= PM10_WARNING){
-    Serial.println("WARNING: ELEVATED LEVELS (45 ug/m³)\n");
-    pm10AlertSent = false;
-    if (!pm10WarningSent){
-      bot.sendMessage(CHAT_ID, "WARNING: ELEVATED LEVELS (45 ug/m³)", "");
-      pm10WarningSent = true;
-    }
-  }
-  else{
-    Serial.println("DUST LEVELS: NORMAL");
-    pm10AlertSent = false;
-    pm10WarningSent = false;
-  }       
+      Serial.print("PM 10.0 STATUS:");
+      if (stablePM10_0 >= PM10_DANGER){
+        Serial.println("ALERT: EXCEEDS EXPOSURE LIMIT (50 ug/m³)\n");
+        pm10WarningSent = false;
+        if (!pm10AlertSent){
+          bot.sendMessage(CHAT_ID, "ALERT: EXCEEDS EXPOSURE LIMIT (50 ug/m³)", "");
+          pm10AlertSent = true;
+        }
+      }
+      else if (stablePM10_0 >= PM10_WARNING){
+        Serial.println("WARNING: ELEVATED LEVELS (45 ug/m³)\n");
+        pm10AlertSent = false;
+        if (!pm10WarningSent){
+          bot.sendMessage(CHAT_ID, "WARNING: ELEVATED LEVELS (45 ug/m³)", "");
+          pm10WarningSent = true;
+        }
+      }
+      else{
+        Serial.println("DUST LEVELS: NORMAL");
+        pm10AlertSent = false;
+        pm10WarningSent = false;
+      }       
+      
       // --- Firebase Sync ---
       if (Firebase.ready()) {
         Firebase.RTDB.setFloat(&fbdo, "/tripAD/noise", currentDBA);
-        Firebase.RTDB.setFloat(&fbdo, "/tripAD/vibration", magnitude);
+        Firebase.RTDB.setFloat(&fbdo, "/tripAD/vibration", globalMagnitude);
         Firebase.RTDB.setInt(&fbdo, "/tripAD/pm25", stablePM2_5);
         Firebase.RTDB.setInt(&fbdo, "/tripAD/pm10", stablePM10_0);
         Firebase.RTDB.setInt(&fbdo, "/tripAD/pm1", stablePM1_0);
@@ -299,6 +360,9 @@ void loop() {
       } else {
         Serial.println(">>> Firebase Error: Not Ready <<<");
       }
+      
+      // --- Refresh the OLED Screen with current data ---
+      updateOLED();
       
       Serial.println("------------------------------------------");
     }
